@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: bazaar_postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=bazaar_data
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - bazaar-network
+
+  fetcher:
+    build: ./scraper
+    container_name: bazaar_fetcher
+    restart: always
+    command: ["python", "fetcher.py"]
+    environment:
+      - POSTGRES_URI=postgresql://user:password@postgres:5432/bazaar_data
+    depends_on:
+      - postgres
+    networks:
+      - bazaar-network
+
+  sql_processor:
+    build: ./scraper
+    container_name: bazaar_sql_processor
+    restart: always
+    command: ["python", "sql_processor.py"]
+    environment:
+      - POSTGRES_URI=postgresql://user:password@postgres:5432/bazaar_data
+    depends_on:
+      - postgres
+    networks:
+      - bazaar-network
+
+  api:
+    build: ./api
+    container_name: bazaar_api
+    restart: always
+    ports:
+      - "8001:8000"
+    environment:
+      - POSTGRES_URI=postgresql://user:password@postgres:5432/bazaar_data
+    depends_on:
+      - postgres
+    networks:
+      - bazaar-network
+
+  adminer:
+    image: adminer
+    container_name: bazaar_adminer
+    restart: always
+    ports:
+      - "8080:8080"
+    networks:
+      - bazaar-network
+
+networks:
+  bazaar-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
