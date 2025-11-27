@@ -53,6 +53,7 @@ The API runs on port `8001` by default.
 
 - `GET /health`: Health check.
 - `GET /latest`: Returns the latest processed bazaar data snapshot.
+- `GET /products`: Returns a list of all available products.
 
 ### Products
 

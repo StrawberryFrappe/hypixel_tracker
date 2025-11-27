@@ -150,6 +150,18 @@ def get_latest_bazaar_data():
     finally:
         session.close()
 
+@app.get("/products")
+def get_products():
+    session = get_db_session()
+    try:
+        products = session.query(Product).all()
+        return [{"id": p.id, "name": p.name} for p in products]
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
 @app.get("/products/{product_id}/status")
 def get_product_status_history(
     product_id: str,
