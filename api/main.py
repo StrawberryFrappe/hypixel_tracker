@@ -1,6 +1,8 @@
 import os
 import logging
-from typing import Optional, List
+from typing import Optional, List, Union
+from datetime import datetime
+from dateutil import parser as date_parser
 from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Float, ForeignKey, desc, and_
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, joinedload
@@ -72,6 +74,40 @@ def get_db_session():
     Session = sessionmaker(bind=engine)
     return Session()
 
+def parse_time_param(param: Union[int, str, None]) -> Optional[int]:
+    if param is None:
+        return None
+    if isinstance(param, int):
+        return param
+    if isinstance(param, str):
+        if param.isdigit():
+            return int(param)
+        try:
+            dt = date_parser.parse(param)
+            return int(dt.timestamp() * 1000)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid date format: {param}. Error: {e}")
+    return None
+
+def parse_lookback(lookback_str: str) -> int:
+    try:
+        parts = list(map(int, lookback_str.split(':')))
+        if len(parts) != 5:
+            raise ValueError("Invalid format")
+        months, days, hours, minutes, seconds = parts
+        
+        # Approximate month as 30 days
+        total_seconds = (
+            months * 30 * 24 * 3600 +
+            days * 24 * 3600 +
+            hours * 3600 +
+            minutes * 60 +
+            seconds
+        )
+        return total_seconds * 1000 # Convert to ms
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid lookback format. Expected MM:DD:HH:MM:SS. Error: {e}")
+
 @app.get("/latest")
 def get_latest_bazaar_data():
     session = get_db_session()
@@ -117,18 +153,32 @@ def get_latest_bazaar_data():
 @app.get("/products/{product_id}/status")
 def get_product_status_history(
     product_id: str,
-    start: Optional[int] = Query(None, description="Start timestamp (ms)"),
-    end: Optional[int] = Query(None, description="End timestamp (ms)"),
+    start: Union[int, str, None] = Query(None, description="Start timestamp (ms) or ISO date string"),
+    end: Union[int, str, None] = Query(None, description="End timestamp (ms) or ISO date string"),
+    lookback: Optional[str] = Query(None, description="Lookback duration in MM:DD:HH:MM:SS format"),
     limit: int = Query(100, le=1000, description="Max records to return")
 ):
     session = get_db_session()
     try:
+        start_ts = parse_time_param(start)
+        end_ts = parse_time_param(end)
+        
+        if lookback:
+            lookback_ms = parse_lookback(lookback)
+            if end_ts:
+                start_ts = end_ts - lookback_ms
+            else:
+                # If end is not provided, default to now
+                now_ms = int(datetime.utcnow().timestamp() * 1000)
+                start_ts = now_ms - lookback_ms
+                # We don't necessarily set end_ts to now, as we want all data up to now (or whatever the latest is)
+
         query = session.query(ProductStatus).join(Update).filter(ProductStatus.product_id == product_id)
         
-        if start:
-            query = query.filter(Update.timestamp >= start)
-        if end:
-            query = query.filter(Update.timestamp <= end)
+        if start_ts:
+            query = query.filter(Update.timestamp >= start_ts)
+        if end_ts:
+            query = query.filter(Update.timestamp <= end_ts)
             
         # Order by timestamp desc
         query = query.order_by(desc(Update.timestamp))
@@ -149,6 +199,8 @@ def get_product_status_history(
             })
             
         return result
+    except HTTPException as e:
+        raise e
     except Exception as e:
         logging.error(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -158,19 +210,31 @@ def get_product_status_history(
 @app.get("/products/{product_id}/buy-offers")
 def get_product_buy_offers(
     product_id: str,
-    start: Optional[int] = Query(None, description="Start timestamp (ms)"),
-    end: Optional[int] = Query(None, description="End timestamp (ms)"),
+    start: Union[int, str, None] = Query(None, description="Start timestamp (ms) or ISO date string"),
+    end: Union[int, str, None] = Query(None, description="End timestamp (ms) or ISO date string"),
+    lookback: Optional[str] = Query(None, description="Lookback duration in MM:DD:HH:MM:SS format"),
     limit: int = Query(100, le=1000, description="Max records to return")
 ):
     session = get_db_session()
     try:
+        start_ts = parse_time_param(start)
+        end_ts = parse_time_param(end)
+
+        if lookback:
+            lookback_ms = parse_lookback(lookback)
+            if end_ts:
+                start_ts = end_ts - lookback_ms
+            else:
+                now_ms = int(datetime.utcnow().timestamp() * 1000)
+                start_ts = now_ms - lookback_ms
+
         # Join ProductStatus and Update to filter by time and product
         query = session.query(BuyOffer).join(ProductStatus).join(Update).filter(ProductStatus.product_id == product_id)
         
-        if start:
-            query = query.filter(Update.timestamp >= start)
-        if end:
-            query = query.filter(Update.timestamp <= end)
+        if start_ts:
+            query = query.filter(Update.timestamp >= start_ts)
+        if end_ts:
+            query = query.filter(Update.timestamp <= end_ts)
             
         query = query.order_by(desc(Update.timestamp))
         
@@ -186,6 +250,8 @@ def get_product_buy_offers(
             })
             
         return result
+    except HTTPException as e:
+        raise e
     except Exception as e:
         logging.error(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -195,18 +261,30 @@ def get_product_buy_offers(
 @app.get("/products/{product_id}/sell-offers")
 def get_product_sell_offers(
     product_id: str,
-    start: Optional[int] = Query(None, description="Start timestamp (ms)"),
-    end: Optional[int] = Query(None, description="End timestamp (ms)"),
+    start: Union[int, str, None] = Query(None, description="Start timestamp (ms) or ISO date string"),
+    end: Union[int, str, None] = Query(None, description="End timestamp (ms) or ISO date string"),
+    lookback: Optional[str] = Query(None, description="Lookback duration in MM:DD:HH:MM:SS format"),
     limit: int = Query(100, le=1000, description="Max records to return")
 ):
     session = get_db_session()
     try:
+        start_ts = parse_time_param(start)
+        end_ts = parse_time_param(end)
+
+        if lookback:
+            lookback_ms = parse_lookback(lookback)
+            if end_ts:
+                start_ts = end_ts - lookback_ms
+            else:
+                now_ms = int(datetime.utcnow().timestamp() * 1000)
+                start_ts = now_ms - lookback_ms
+
         query = session.query(SellOffer).join(ProductStatus).join(Update).filter(ProductStatus.product_id == product_id)
         
-        if start:
-            query = query.filter(Update.timestamp >= start)
-        if end:
-            query = query.filter(Update.timestamp <= end)
+        if start_ts:
+            query = query.filter(Update.timestamp >= start_ts)
+        if end_ts:
+            query = query.filter(Update.timestamp <= end_ts)
             
         query = query.order_by(desc(Update.timestamp))
         
@@ -222,6 +300,8 @@ def get_product_sell_offers(
             })
             
         return result
+    except HTTPException as e:
+        raise e
     except Exception as e:
         logging.error(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

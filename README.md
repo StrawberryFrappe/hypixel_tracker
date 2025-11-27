@@ -44,3 +44,39 @@ The project is structured as follows:
 - `api/`: FastAPI application code.
 - `scraper/`: Data fetching and processing logic.
 - `docker-compose.yml`: Service definitions.
+
+## API Endpoints
+
+The API runs on port `8001` by default.
+
+### General
+
+- `GET /health`: Health check.
+- `GET /latest`: Returns the latest processed bazaar data snapshot.
+
+### Products
+
+All product endpoints support the following query parameters:
+- `start` (optional): Start timestamp (Unix milliseconds) or ISO 8601 date string (e.g., `2023-10-27T10:00:00`).
+- `end` (optional): End timestamp (Unix milliseconds) or ISO 8601 date string.
+- `lookback` (optional): Duration to look back from `end` (or now if `end` is not provided). Format: `MM:DD:HH:MM:SS` (Months:Days:Hours:Minutes:Seconds).
+- `limit` (optional): Maximum number of records to return (default: 100, max: 1000).
+
+#### Endpoints
+
+- `GET /products/{product_id}/status`: Get historical status (prices, volumes, etc.) for a specific product.
+- `GET /products/{product_id}/buy-offers`: Get historical buy offers for a specific product.
+- `GET /products/{product_id}/sell-offers`: Get historical sell offers for a specific product.
+
+### Example Usage
+
+```bash
+# Get status history for Enchanted Iron Ingot (last 5 records)
+curl "http://localhost:8001/products/ENCHANTED_IRON_INGOT/status?limit=5"
+
+# Get status history for a specific date range
+curl "http://localhost:8001/products/ENCHANTED_IRON_INGOT/status?start=2023-10-27T00:00:00&end=2023-10-28T00:00:00"
+
+# Get status history for the last 24 hours
+curl "http://localhost:8001/products/ENCHANTED_IRON_INGOT/status?lookback=00:00:24:00:00"
+```
