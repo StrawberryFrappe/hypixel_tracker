@@ -20,13 +20,7 @@ The project is composed of the following Docker services:
 
 ### Running the Project
 
-You can start all services using the provided script:
-
-```bash
-./deploy.sh
-```
-
-Or manually with Docker Compose:
+Start all services with Docker Compose:
 
 ```bash
 docker compose up -d --build
