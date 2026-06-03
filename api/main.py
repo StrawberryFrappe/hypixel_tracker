@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import shutil
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -80,9 +81,30 @@ class ExportBundle(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
 
 
+def create_all_with_retry(retries: int = 8, delay: float = 1.0) -> None:
+    """Create tables tolerating the concurrent-create race.
+
+    The api and collector both run create_all at startup; two simultaneous
+    CREATE TABLEs can collide on Postgres catalog unique indexes
+    (e.g. pg_type_typname_nsp_index). Retrying lets the loser see the table
+    already exists (checkfirst) and become a no-op.
+    """
+    from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+
+    for attempt in range(retries):
+        try:
+            Base.metadata.create_all(engine)
+            return
+        except (IntegrityError, OperationalError, ProgrammingError) as exc:
+            if attempt == retries - 1:
+                raise
+            logger.warning("create_all contention (attempt %s): %s; retrying", attempt + 1, exc)
+            time.sleep(delay)
+
+
 def init_db() -> None:
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(engine)
+    create_all_with_retry()
 
 
 def provision_sandbox() -> None:

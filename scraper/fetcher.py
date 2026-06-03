@@ -18,7 +18,7 @@ from sqlalchemy import (
     create_engine,
     desc,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -52,7 +52,17 @@ class RawSnapshot(Base):
 
 def get_session_factory():
     engine = create_engine(POSTGRES_URI, pool_pre_ping=True)
-    Base.metadata.create_all(engine)
+    # The api and collector start together; tolerate the concurrent-create race
+    # on Postgres catalog indexes instead of relying on the restart policy.
+    for attempt in range(8):
+        try:
+            Base.metadata.create_all(engine)
+            break
+        except (IntegrityError, OperationalError, ProgrammingError) as exc:
+            if attempt == 7:
+                raise
+            logger.warning("create_all contention (attempt %s): %s; retrying", attempt + 1, exc)
+            time.sleep(1)
     return sessionmaker(bind=engine)
 
 

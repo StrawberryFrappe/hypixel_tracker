@@ -41,6 +41,7 @@ DISK_ALERT_PERCENT = float(os.environ.get("DISK_ALERT_PERCENT", "80"))
 MEMORY_TURNS = int(os.environ.get("BOT_MEMORY_TURNS", "10"))
 SQL_TIMEOUT_MS = int(os.environ.get("BOT_SQL_TIMEOUT_MS", "10000"))
 SQL_ROW_LIMIT = int(os.environ.get("BOT_SQL_ROW_LIMIT", "50"))
+MAX_TOOL_STEPS = int(os.environ.get("BOT_MAX_TOOL_STEPS", "14"))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -231,13 +232,20 @@ SYSTEM_PROMPT = (
     "over time. You may read the immutable archive (public.raw_bazaar_snapshots, "
     "public.export_bundles) but cannot modify it.\n"
     "- load_market_snapshot(count, snapshot_id) parses raw snapshots into "
-    "sandbox.product_prices(product_id, source_last_updated, fetched_at, sell_price, "
-    "buy_price, sell_volume, buy_volume, sell_moving_week, buy_moving_week, sell_orders, "
-    "buy_orders). Load several snapshots when you need trends/velocity over time.\n"
+    "sandbox.product_prices. Its EXACT columns are: product_id, source_last_updated "
+    "(bigint, the snapshot's Hypixel timestamp — there is NO `snapshot_id` column), "
+    "fetched_at, sell_price, buy_price, sell_volume, buy_volume, sell_moving_week, "
+    "buy_moving_week, sell_orders, buy_orders. The table can hold many snapshots per "
+    "product; for CURRENT prices filter to the newest snapshot, e.g. WHERE "
+    "source_last_updated = (SELECT max(source_last_updated) FROM sandbox.product_prices), "
+    "or use SELECT DISTINCT ON (product_id) ... ORDER BY product_id, source_last_updated "
+    "DESC. Load several snapshots only when you need trends over time.\n"
     "- Bazaar price semantics: buy_price = instant-buy (higher), sell_price = instant-sell "
     "(lower). Flip margin per unit ≈ buy_price - sell_price; margin% ≈ (buy_price - "
     "sell_price)/sell_price. Velocity ≈ moving_week volume. 'Good' opportunities pair a "
     "healthy margin% with high moving-week velocity.\n"
+    "- Be decisive: as soon as a query returns usable rows, answer — do not keep re-running "
+    "variations of the same query. If a query errors, read the error and fix it once.\n"
     "- Keep replies concise. Show concrete product ids and numbers. If you are genuinely "
     "blocked, ask exactly ONE specific question."
 )
@@ -325,7 +333,15 @@ async def run_tool(name: str, tool_input: dict) -> str:
     return json.dumps(result, default=str)
 
 
-async def anthropic_request(messages: list[dict]) -> dict:
+async def anthropic_request(messages: list[dict], use_tools: bool = True) -> dict:
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 1024,
+        "system": SYSTEM_PROMPT,
+        "messages": messages,
+    }
+    if use_tools:
+        payload["tools"] = TOOLS
     async with httpx.AsyncClient(timeout=90.0) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -334,16 +350,14 @@ async def anthropic_request(messages: list[dict]) -> dict:
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 1024,
-                "system": SYSTEM_PROMPT,
-                "tools": TOOLS,
-                "messages": messages,
-            },
+            json=payload,
         )
         response.raise_for_status()
         return response.json()
+
+
+def _text_of(blocks: list[dict]) -> str:
+    return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
 
 
 async def handle_request(base_messages: list[dict]) -> str:
@@ -351,7 +365,7 @@ async def handle_request(base_messages: list[dict]) -> str:
         return "Natural-language mode is unavailable: ANTHROPIC_API_KEY is not set."
 
     messages = list(base_messages)
-    for _ in range(8):
+    for _ in range(MAX_TOOL_STEPS):
         data = await anthropic_request(messages)
         blocks = data.get("content", [])
         if data.get("stop_reason") == "tool_use":
@@ -364,9 +378,14 @@ async def handle_request(base_messages: list[dict]) -> str:
                     tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": output})
             messages.append({"role": "user", "content": tool_results})
             continue
-        text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
-        return text or "(no response)"
-    return "Stopped after too many reasoning steps. Try a more specific request."
+        return _text_of(blocks) or "(no response)"
+
+    # Step budget exhausted: force a final answer from the data already gathered
+    # (no tools available, so the model must respond with text).
+    data = await anthropic_request(messages, use_tools=False)
+    return _text_of(data.get("content", [])) or (
+        "I gathered the data but couldn't finalize an answer — try narrowing the request."
+    )
 
 
 async def send_chunked(channel, text: str) -> None:
