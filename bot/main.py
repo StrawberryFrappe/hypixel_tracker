@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -46,14 +47,20 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
-def is_allowed(ctx: commands.Context) -> bool:
-    if ALLOWED_USER_IDS and ctx.author.id not in ALLOWED_USER_IDS:
+# --------------------------------------------------------------------------- #
+# Access control
+# --------------------------------------------------------------------------- #
+def is_allowed(author_id: int, guild_id: int | None) -> bool:
+    if ALLOWED_USER_IDS and author_id not in ALLOWED_USER_IDS:
         return False
-    if ALLOWED_GUILD_IDS and ctx.guild and ctx.guild.id not in ALLOWED_GUILD_IDS:
+    if ALLOWED_GUILD_IDS and guild_id is not None and guild_id not in ALLOWED_GUILD_IDS:
         return False
     return True
 
 
+# --------------------------------------------------------------------------- #
+# Backend helpers (API + read-only SQL + product lookup)
+# --------------------------------------------------------------------------- #
 async def api_get(path: str) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(f"{API_BASE_URL}{path}", headers={"X-API-Key": API_KEY})
@@ -80,10 +87,6 @@ def format_bytes(value: int | float | None) -> str:
     return f"{value:.2f} TiB"
 
 
-def format_hypixel_ms(value: int) -> str:
-    return datetime.fromtimestamp(value / 1000, tz=timezone.utc).strftime("%d/%m/%Y")
-
-
 def validate_select_sql(sql: str) -> str:
     statement = sql.strip().rstrip(";")
     lowered = statement.lower()
@@ -107,16 +110,103 @@ def run_readonly_sql(sql: str) -> list[dict]:
             return [dict(row) for row in cur.fetchall()]
 
 
-async def ask_anthropic(question: str, context: dict) -> str:
-    if not ANTHROPIC_API_KEY:
-        return "Anthropic is not configured. Set ANTHROPIC_API_KEY to enable natural-language analysis."
-    prompt = (
-        "You are a concise Hypixel SkyBlock Bazaar database and data-science expert. "
-        "Use the provided archive context. Do not claim live facts that are not in the context. "
-        "If deeper analysis needs SQL, suggest the exact read-only SQL query.\n\n"
-        f"Archive context:\n{context}\n\nQuestion: {question}"
-    )
-    async with httpx.AsyncClient(timeout=60.0) as client:
+async def get_product_quote(product_id: str) -> dict:
+    pid = product_id.strip().upper()
+    data = await api_get("/snapshots/latest")
+    products = data.get("payload", {}).get("products", {})
+    info = products.get(pid)
+    if not info:
+        sample = list(products)[:10]
+        return {"error": f"Product '{pid}' not found in latest snapshot.", "example_product_ids": sample}
+    return {
+        "product_id": pid,
+        "quick_status": info.get("quick_status", {}),
+        "snapshot_fetched_at": data.get("metadata", {}).get("fetched_at"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Natural-language layer (Anthropic tool use)
+# --------------------------------------------------------------------------- #
+SYSTEM_PROMPT = (
+    "You are the private operations and market-analysis assistant for a Hypixel SkyBlock "
+    "Bazaar raw-archive service. You help exactly one operator manage and query their own "
+    "archive. Be concise and practical.\n\n"
+    "Scope: you only know about this Bazaar archive. Do NOT answer about real-world stock "
+    "markets, news, or general topics, and never invent live facts. If asked something "
+    "outside the Bazaar archive, say it is out of scope.\n\n"
+    "Use the tools to get real data before answering. The archive stores raw gzipped "
+    "Hypixel Bazaar API responses; per-product prices live inside snapshot payloads (use "
+    "get_product_quote), while SQL only sees snapshot/export metadata tables. When you "
+    "create a backup, always give the operator the download link and its expiry."
+)
+
+TOOLS = [
+    {
+        "name": "get_archive_status",
+        "description": "Get current archive and disk status: snapshot count, database size, disk usage percent, free space, and estimated days of storage remaining.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "create_backup",
+        "description": "Create a compressed range backup (.jsonl.gz) of recent snapshots and return an expiring signed download link.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "How many days back to include (1-90).", "default": 7},
+                "expires_in_days": {"type": "integer", "description": "Days until the download link expires (1-30).", "default": 7},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "run_sql",
+        "description": (
+            "Run ONE read-only SELECT/WITH query against archive metadata tables. "
+            "Tables: raw_bazaar_snapshots(id, endpoint, fetched_at, source_last_updated, response_hash, "
+            "status_code, payload_size_bytes, compressed_size_bytes) and export_bundles. "
+            "Per-product prices are NOT here (they are inside compressed payloads). Returns up to 25 rows."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "A single read-only SELECT or WITH statement."}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_product_quote",
+        "description": "Get the latest Bazaar quick-status (buy/sell price, volumes, orders) for one product id (e.g. ENCHANTED_DIAMOND, INK_SACK:3) from the most recent archived snapshot.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"product_id": {"type": "string", "description": "Hypixel Bazaar product id."}},
+            "required": ["product_id"],
+        },
+    },
+]
+
+
+async def run_tool(name: str, tool_input: dict) -> str:
+    try:
+        if name == "get_archive_status":
+            result = await api_get("/storage/status")
+        elif name == "create_backup":
+            days = int(tool_input.get("days", 7))
+            expires = int(tool_input.get("expires_in_days", 7))
+            result = await api_post("/exports", {"days": days, "expires_in_days": expires})
+        elif name == "run_sql":
+            rows = await asyncio.to_thread(run_readonly_sql, tool_input.get("query", ""))
+            result = {"rows": rows, "row_count": len(rows)}
+        elif name == "get_product_quote":
+            result = await get_product_quote(tool_input.get("product_id", ""))
+        else:
+            result = {"error": f"Unknown tool {name}"}
+    except Exception as exc:  # noqa: BLE001 - surface tool errors back to the model
+        result = {"error": str(exc)}
+    return json.dumps(result, default=str)
+
+
+async def anthropic_request(messages: list[dict]) -> dict:
+    async with httpx.AsyncClient(timeout=90.0) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -126,81 +216,73 @@ async def ask_anthropic(question: str, context: dict) -> str:
             },
             json={
                 "model": ANTHROPIC_MODEL,
-                "max_tokens": 800,
-                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1024,
+                "system": SYSTEM_PROMPT,
+                "tools": TOOLS,
+                "messages": messages,
             },
         )
         response.raise_for_status()
-        data = response.json()
-    return "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
+        return response.json()
 
 
-@bot.check
-async def globally_allowed(ctx: commands.Context) -> bool:
-    if is_allowed(ctx):
-        return True
-    logger.warning("Rejected Discord command from user=%s guild=%s", ctx.author.id, ctx.guild.id if ctx.guild else None)
-    return False
+async def handle_request(user_text: str) -> str:
+    if not ANTHROPIC_API_KEY:
+        return "Natural-language mode is unavailable: ANTHROPIC_API_KEY is not set."
+
+    messages: list[dict] = [{"role": "user", "content": user_text}]
+    for _ in range(6):
+        data = await anthropic_request(messages)
+        blocks = data.get("content", [])
+        if data.get("stop_reason") == "tool_use":
+            messages.append({"role": "assistant", "content": blocks})
+            tool_results = []
+            for block in blocks:
+                if block.get("type") == "tool_use":
+                    logger.info("Tool call: %s %s", block.get("name"), block.get("input"))
+                    output = await run_tool(block["name"], block.get("input", {}))
+                    tool_results.append(
+                        {"type": "tool_result", "tool_use_id": block["id"], "content": output}
+                    )
+            messages.append({"role": "user", "content": tool_results})
+            continue
+        text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+        return text or "(no response)"
+    return "Stopped after too many reasoning steps. Try a more specific request."
 
 
+async def send_chunked(channel, text: str) -> None:
+    for i in range(0, len(text), 1900):
+        await channel.send(text[i : i + 1900])
+
+
+# --------------------------------------------------------------------------- #
+# Discord events
+# --------------------------------------------------------------------------- #
 @bot.event
 async def on_ready() -> None:
     logger.info("Discord bot connected as %s", bot.user)
-    disk_pressure_watch.start()
+    if not disk_pressure_watch.is_running():
+        disk_pressure_watch.start()
 
 
-@bot.command(name="status")
-async def status(ctx: commands.Context) -> None:
-    data = await api_get("/storage/status")
-    disk = data["disk"]
-    await ctx.reply(
-        "\n".join(
-            [
-                f"Snapshots: {data['snapshot_count']}",
-                f"DB size: {format_bytes(data['database_size_bytes'])}",
-                f"Disk used: {disk['used_percent']}% ({format_bytes(disk['free_bytes'])} free)",
-                f"Estimated remaining: {data['estimated_days_remaining_at_current_average']} days",
-            ]
-        )
-    )
-
-
-@bot.command(name="backup")
-async def backup(ctx: commands.Context, days: int = 7) -> None:
-    data = await api_post("/exports", {"days": days, "expires_in_days": 7})
-    export = data["export"]
-    await ctx.reply(
-        "Backup from "
-        f"{format_hypixel_ms(export['start_source_last_updated'])} "
-        f"to {format_hypixel_ms(export['end_source_last_updated'])} is ready: "
-        f"{export['download_url']}. Expected deletion: "
-        f"{datetime.fromisoformat(export['expires_at']).strftime('%d/%m/%Y')}."
-    )
-
-
-@bot.command(name="sql")
-async def sql(ctx: commands.Context, *, query: str) -> None:
-    try:
-        rows = await asyncio.to_thread(run_readonly_sql, query)
-    except Exception as exc:
-        await ctx.reply(f"SQL rejected or failed: {exc}")
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot or (bot.user and message.author.id == bot.user.id):
         return
-    text = str(rows[:5])
-    if len(text) > 1800:
-        text = text[:1800] + "..."
-    await ctx.reply(f"```json\n{text}\n```")
-
-
-@bot.command(name="ask")
-async def ask(ctx: commands.Context, *, question: str) -> None:
-    storage = await api_get("/storage/status")
-    latest = await api_get("/snapshots?limit=1")
-    context = {
-        "storage": storage,
-        "latest_snapshot_metadata": latest.get("snapshots", [{}])[0] if latest.get("snapshots") else None,
-    }
-    answer = await ask_anthropic(question, context)
-    await ctx.reply(answer[:1900])
+    guild_id = message.guild.id if message.guild else None
+    if not is_allowed(message.author.id, guild_id):
+        return
+    content = message.content.strip()
+    if not content:
+        return
+    async with message.channel.typing():
+        try:
+            reply = await handle_request(content)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Request handling failed")
+            reply = f"Sorry, I hit an error handling that: {exc}"
+    await send_chunked(message.channel, reply)
 
 
 @tasks.loop(minutes=30)
