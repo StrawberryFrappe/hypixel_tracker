@@ -101,14 +101,28 @@ All endpoints except `/health` require `X-API-Key`.
 
 ## Discord Bot
 
-Commands:
+The bot is natural-language (no slash/`!` commands): just message it. An Anthropic-backed
+agent interprets each request and uses tools to answer — archive/disk status, on-demand
+market loading, read-only canonical queries plus a writable sandbox, expiring backups, and
+single-product quotes. It keeps short rolling per-channel memory and DMs the operator on
+disk pressure.
 
-- `!status`: archive and disk status.
-- `!backup 7`: create a range export for the last 7 days and return an expiring link.
-- `!ask <question>`: ask the Anthropic-backed market expert using archive context.
-- `!sql <select query>`: run read-only SQL with timeout and row limits.
+It only responds to configured users/guilds (`DISCORD_ALLOWED_USER_IDS` /
+`DISCORD_ALLOWED_GUILD_IDS`).
 
-The bot only responds to configured users/guilds. It sends disk pressure alerts to the configured alert channel.
+### Agent sandbox ("accountant")
+
+The bot connects as a least-privilege Postgres role (`AGENT_DB_USER` /
+`AGENT_DB_PASSWORD`, provisioned automatically by the API at startup):
+
+- it can **read** the immutable canonical archive (`public.raw_bazaar_snapshots`,
+  `public.export_bundles`) but cannot modify it (enforced by Postgres, not by a regex);
+- it **owns** a `sandbox` schema where it can freely create/fill/query its own analytics
+  tables (e.g. `sandbox.product_prices`) and grow them over time.
+
+`load_market_snapshot` parses raw snapshots into `sandbox.product_prices` so the agent can
+compute margins (buy_price − sell_price), margin %, and velocity (moving-week volume) on
+demand.
 
 ## Course Criteria Mapping
 
@@ -120,5 +134,5 @@ The bot only responds to configured users/guilds. It sends disk pressure alerts 
 - Error handling: request timeouts, duplicate skips, failed-fetch logs.
 - Health and observability: `/health`, `/storage/status`, structured logs.
 - Continuity: compressed range exports with expiring links.
-- Security: API key auth, private Discord allowlist, read-only SQL guard.
+- Security: API key auth, private Discord allowlist, least-privilege agent DB role (canonical read-only + isolated sandbox), optional source-IP firewall lockdown.
 - Rollback: git branch plus Compose rebuild/redeploy.

@@ -36,6 +36,8 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 BACKUP_CACHE_BYTES = int(os.environ.get("BACKUP_CACHE_BYTES", str(25 * 1024**3)))
 DISK_WARN_PERCENT = float(os.environ.get("DISK_WARN_PERCENT", "80"))
 SNAPSHOT_INTERVAL_SECONDS = int(os.environ.get("SNAPSHOT_INTERVAL_SECONDS", "20"))
+AGENT_DB_USER = os.environ.get("AGENT_DB_USER", "agent")
+AGENT_DB_PASSWORD = os.environ.get("AGENT_DB_PASSWORD", "")
 
 Base = declarative_base()
 engine = create_engine(POSTGRES_URI, pool_pre_ping=True)
@@ -83,12 +85,50 @@ def init_db() -> None:
     Base.metadata.create_all(engine)
 
 
+def provision_sandbox() -> None:
+    """Create a least-privilege `agent` role + `sandbox` schema it owns.
+
+    The agent may read the immutable canonical archive but can only write inside
+    `sandbox`. Idempotent; runs as the admin superuser the API connects with.
+    """
+    if not AGENT_DB_PASSWORD:
+        logger.warning("AGENT_DB_PASSWORD not set; skipping sandbox provisioning")
+        return
+    from psycopg2 import sql as pgsql
+
+    role = pgsql.Identifier(AGENT_DB_USER)
+    pw = pgsql.Literal(AGENT_DB_PASSWORD)
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (AGENT_DB_USER,))
+        if cur.fetchone() is None:
+            cur.execute(pgsql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(role, pw))
+        else:
+            cur.execute(pgsql.SQL("ALTER ROLE {} LOGIN PASSWORD {}").format(role, pw))
+        cur.execute(pgsql.SQL("CREATE SCHEMA IF NOT EXISTS sandbox AUTHORIZATION {}").format(role))
+        cur.execute(pgsql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(role))
+        cur.execute(
+            pgsql.SQL(
+                "GRANT SELECT ON public.raw_bazaar_snapshots, public.export_bundles TO {}"
+            ).format(role)
+        )
+        # Defense in depth: ensure the agent can never create objects in public.
+        cur.execute(pgsql.SQL("REVOKE CREATE ON SCHEMA public FROM {}").format(role))
+        cur.close()
+        raw.commit()
+        logger.info("Sandbox provisioned: role %s + schema sandbox", AGENT_DB_USER)
+    finally:
+        raw.close()
+
+
 app = FastAPI(title="Hypixel Bazaar Raw Archive", version="0.1.0")
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    provision_sandbox()
     if API_KEY == "dev-api-key":
         logger.warning("Using default API_KEY. Set a strong API_KEY before deployment.")
 
