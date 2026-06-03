@@ -1,94 +1,151 @@
+import gzip
+import hashlib
+import json
+import logging
 import os
 import time
+from datetime import datetime, timezone
+
 import requests
-import logging
-from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, BigInteger, DateTime
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    Integer,
+    LargeBinary,
+    String,
+    UniqueConstraint,
+    create_engine,
+    desc,
+)
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import desc
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("bazaar.collector")
 
-# Environment variables
 POSTGRES_URI = os.environ.get("POSTGRES_URI", "postgresql://user:password@postgres:5432/bazaar_data")
-API_URL = "https://api.hypixel.net/v2/skyblock/bazaar"
+API_URL = os.environ.get("HYPIXEL_BAZAAR_URL", "https://api.hypixel.net/v2/skyblock/bazaar")
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
+REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))
 
 Base = declarative_base()
 
-class RawBazaarData(Base):
-    __tablename__ = 'raw_bazaar_data'
+
+class RawSnapshot(Base):
+    __tablename__ = "raw_bazaar_snapshots"
+    __table_args__ = (
+        UniqueConstraint("source_last_updated", name="uq_bazaar_source_last_updated"),
+        UniqueConstraint("response_hash", name="uq_bazaar_response_hash"),
+    )
+
     id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    lastUpdated = Column(BigInteger)
-    data = Column(JSONB)
+    endpoint = Column(String, nullable=False, default="/v2/skyblock/bazaar")
+    fetched_at = Column(DateTime(timezone=True), nullable=False)
+    source_last_updated = Column(BigInteger, nullable=False, index=True)
+    response_hash = Column(String(64), nullable=False, index=True)
+    status_code = Column(Integer, nullable=False)
+    payload_size_bytes = Column(Integer, nullable=False)
+    compressed_size_bytes = Column(Integer, nullable=False)
+    payload_gzip = Column(LargeBinary, nullable=False)
 
-def get_db_session():
-    engine = create_engine(POSTGRES_URI)
+
+def get_session_factory():
+    engine = create_engine(POSTGRES_URI, pool_pre_ping=True)
     Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    return Session()
+    return sessionmaker(bind=engine)
 
-def fetch_bazaar_data():
+
+def fetch_bazaar_response() -> tuple[int, bytes] | None:
     try:
-        response = requests.get(API_URL, timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logging.error(f"Error fetching data: {e}")
+        response = requests.get(API_URL, timeout=REQUEST_TIMEOUT_SECONDS)
+    except requests.RequestException as exc:
+        logger.warning("Hypixel fetch failed: %s", exc)
         return None
 
-def main():
-    logging.info("Starting Fetcher Service (Postgres)...")
-    
-    # Wait for Postgres
-    time.sleep(10)
-    
-    session = get_db_session()
-    
+    if response.status_code != 200:
+        logger.warning("Hypixel returned status %s", response.status_code)
+        return response.status_code, response.content
+    return response.status_code, response.content
+
+
+def parse_last_updated(raw_bytes: bytes) -> int | None:
+    try:
+        data = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Hypixel response was not valid JSON: %s", exc)
+        return None
+    if not data.get("success"):
+        logger.warning("Hypixel response success flag was false")
+        return None
+    last_updated = data.get("lastUpdated")
+    if not isinstance(last_updated, int):
+        logger.warning("Hypixel response did not include integer lastUpdated")
+        return None
+    return last_updated
+
+
+def store_snapshot(session, status_code: int, raw_bytes: bytes) -> bool:
+    last_updated = parse_last_updated(raw_bytes)
+    if last_updated is None:
+        return False
+
+    response_hash = hashlib.sha256(raw_bytes).hexdigest()
+    latest = session.query(RawSnapshot).order_by(desc(RawSnapshot.id)).first()
+    if latest and (latest.source_last_updated == last_updated or latest.response_hash == response_hash):
+        logger.info("Duplicate Bazaar snapshot skipped: lastUpdated=%s", last_updated)
+        return False
+
+    compressed = gzip.compress(raw_bytes, compresslevel=9)
+    snapshot = RawSnapshot(
+        endpoint="/v2/skyblock/bazaar",
+        fetched_at=datetime.now(timezone.utc),
+        source_last_updated=last_updated,
+        response_hash=response_hash,
+        status_code=status_code,
+        payload_size_bytes=len(raw_bytes),
+        compressed_size_bytes=len(compressed),
+        payload_gzip=compressed,
+    )
+    session.add(snapshot)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        logger.info("Duplicate Bazaar snapshot rejected by database: lastUpdated=%s", last_updated)
+        return False
+    logger.info(
+        "Stored Bazaar snapshot id=%s lastUpdated=%s raw=%s compressed=%s",
+        snapshot.id,
+        last_updated,
+        len(raw_bytes),
+        len(compressed),
+    )
+    return True
+
+
+def main() -> None:
+    logger.info("Starting Hypixel Bazaar raw collector")
+    session_factory = get_session_factory()
+
     while True:
-        start_time = time.time()
-        
-        data = fetch_bazaar_data()
-        if data and data.get("success"):
-            last_updated = data.get("lastUpdated")
-            
-            # Check if we already have this lastUpdated
-            # We query the latest record's data->lastUpdated
-            # Note: Querying JSONB can be slower without index, but for now this is fine.
-            # Alternatively, we can just check the latest record by ID and see its content.
-            
-            latest_record = session.query(RawBazaarData).order_by(desc(RawBazaarData.id)).first()
-            
-            is_new = True
-            if latest_record:
-                stored_last_updated = latest_record.data.get("lastUpdated")
-                if stored_last_updated == last_updated:
-                    is_new = False
-            
-            if is_new:
-                raw_record = RawBazaarData(
-                    timestamp=datetime.utcnow(),
-                    lastUpdated=last_updated,
-                    data=data
-                )
-                try:
-                    session.add(raw_record)
-                    session.commit()
-                    logging.info(f"New data stored. lastUpdated: {last_updated}")
-                except Exception as e:
-                    logging.error(f"Error storing raw data: {e}")
-                    session.rollback()
-            else:
-                logging.info(f"Duplicate data detected. lastUpdated: {last_updated}. Skipping.")
-        else:
-            logging.warning("Failed to fetch data or success is False")
-        
-        # Sleep logic
-        elapsed = time.time() - start_time
-        sleep_time = max(15 - elapsed, 1)
-        time.sleep(sleep_time)
+        started = time.time()
+        session = session_factory()
+        try:
+            result = fetch_bazaar_response()
+            if result is not None:
+                status_code, raw_bytes = result
+                if status_code == 200:
+                    store_snapshot(session, status_code, raw_bytes)
+        except Exception:
+            logger.exception("Collector loop failed")
+            session.rollback()
+        finally:
+            session.close()
+
+        elapsed = time.time() - started
+        time.sleep(max(POLL_INTERVAL_SECONDS - elapsed, 1))
+
 
 if __name__ == "__main__":
     main()

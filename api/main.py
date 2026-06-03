@@ -1,325 +1,315 @@
-import os
+import gzip
+import hashlib
+import json
 import logging
-from typing import Optional, List, Union
-from datetime import datetime
-from dateutil import parser as date_parser
-from fastapi import FastAPI, HTTPException, Query
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Float, ForeignKey, desc, and_
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship, joinedload
+import os
+import secrets
+import shutil
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    Integer,
+    LargeBinary,
+    String,
+    UniqueConstraint,
+    create_engine,
+    desc,
+    func,
+    text,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-app = FastAPI()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("bazaar.api")
 
-# Environment variables
 POSTGRES_URI = os.environ.get("POSTGRES_URI", "postgresql://user:password@postgres:5432/bazaar_data")
+API_KEY = os.environ.get("API_KEY", "dev-api-key")
+EXPORT_DIR = Path(os.environ.get("EXPORT_DIR", "/exports"))
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+BACKUP_CACHE_BYTES = int(os.environ.get("BACKUP_CACHE_BYTES", str(25 * 1024**3)))
+DISK_WARN_PERCENT = float(os.environ.get("DISK_WARN_PERCENT", "80"))
+SNAPSHOT_INTERVAL_SECONDS = int(os.environ.get("SNAPSHOT_INTERVAL_SECONDS", "20"))
 
-# SQLAlchemy Setup (Mirrored from sql_processor.py)
 Base = declarative_base()
+engine = create_engine(POSTGRES_URI, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine)
 
-class Update(Base):
-    __tablename__ = 'update'
-    lastUpdated = Column(BigInteger, primary_key=True)
-    timestamp = Column(BigInteger)
 
-class Product(Base):
-    __tablename__ = 'product'
-    id = Column(String, primary_key=True)
-    name = Column(String)
+class RawSnapshot(Base):
+    __tablename__ = "raw_bazaar_snapshots"
+    __table_args__ = (
+        UniqueConstraint("source_last_updated", name="uq_bazaar_source_last_updated"),
+        UniqueConstraint("response_hash", name="uq_bazaar_response_hash"),
+    )
 
-class ProductStatus(Base):
-    __tablename__ = 'product_status'
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    product_id = Column(String, ForeignKey('product.id'), index=True)
-    update_id = Column(BigInteger, ForeignKey('update.lastUpdated'), index=True)
-    
-    sellPrice = Column(Float)
-    sellVolume = Column(BigInteger)
-    sellMovingWeek = Column(BigInteger)
-    sellOrders = Column(BigInteger)
-    
-    buyPrice = Column(Float)
-    buyVolume = Column(BigInteger)
-    buyMovingWeek = Column(BigInteger)
-    buyOrders = Column(BigInteger)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    endpoint = Column(String, nullable=False, default="/v2/skyblock/bazaar")
+    fetched_at = Column(DateTime(timezone=True), nullable=False)
+    source_last_updated = Column(BigInteger, nullable=False, index=True)
+    response_hash = Column(String(64), nullable=False, index=True)
+    status_code = Column(Integer, nullable=False)
+    payload_size_bytes = Column(Integer, nullable=False)
+    compressed_size_bytes = Column(Integer, nullable=False)
+    payload_gzip = Column(LargeBinary, nullable=False)
 
-    product = relationship("Product")
-    update = relationship("Update")
-    sell_offers = relationship("SellOffer", back_populates="product_status")
-    buy_offers = relationship("BuyOffer", back_populates="product_status")
 
-class SellOffer(Base):
-    __tablename__ = 'sellOffer'
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    product_status_id = Column(BigInteger, ForeignKey('product_status.id'), index=True)
-    amount = Column(BigInteger)
-    pricePerUnit = Column(Float)
-    orders = Column(BigInteger)
-    
-    product_status = relationship("ProductStatus", back_populates="sell_offers")
+class ExportBundle(Base):
+    __tablename__ = "export_bundles"
 
-class BuyOffer(Base):
-    __tablename__ = 'buyOffer'
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    product_status_id = Column(BigInteger, ForeignKey('product_status.id'), index=True)
-    amount = Column(BigInteger)
-    pricePerUnit = Column(Float)
-    orders = Column(BigInteger)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    start_snapshot_id = Column(Integer, nullable=False)
+    end_snapshot_id = Column(Integer, nullable=False)
+    start_source_last_updated = Column(BigInteger, nullable=False)
+    end_source_last_updated = Column(BigInteger, nullable=False)
+    snapshot_count = Column(Integer, nullable=False)
+    file_name = Column(String, nullable=False)
+    file_path = Column(String, nullable=False)
+    file_size_bytes = Column(BigInteger, nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    download_token = Column(String(96), nullable=False, unique=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
 
-    product_status = relationship("ProductStatus", back_populates="buy_offers")
 
-def get_db_session():
-    engine = create_engine(POSTGRES_URI)
-    Session = sessionmaker(bind=engine)
-    return Session()
+def init_db() -> None:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    Base.metadata.create_all(engine)
 
-def parse_time_param(param: Union[int, str, None]) -> Optional[int]:
-    if param is None:
-        return None
-    if isinstance(param, int):
-        return param
-    if isinstance(param, str):
-        if param.isdigit():
-            return int(param)
-        try:
-            dt = date_parser.parse(param)
-            return int(dt.timestamp() * 1000)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid date format: {param}. Error: {e}")
-    return None
 
-def parse_lookback(lookback_str: str) -> int:
+app = FastAPI(title="Hypixel Bazaar Raw Archive", version="0.1.0")
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
+    if API_KEY == "dev-api-key":
+        logger.warning("Using default API_KEY. Set a strong API_KEY before deployment.")
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> None:
+    if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def session_scope():
+    session = SessionLocal()
     try:
-        parts = list(map(int, lookback_str.split(':')))
-        if len(parts) != 5:
-            raise ValueError("Invalid format")
-        months, days, hours, minutes, seconds = parts
-        
-        # Approximate month as 30 days
-        total_seconds = (
-            months * 30 * 24 * 3600 +
-            days * 24 * 3600 +
-            hours * 3600 +
-            minutes * 60 +
-            seconds
-        )
-        return total_seconds * 1000 # Convert to ms
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid lookback format. Expected MM:DD:HH:MM:SS. Error: {e}")
-
-@app.get("/latest")
-def get_latest_bazaar_data():
-    session = get_db_session()
-    try:
-        # Get the latest update
-        latest_update = session.query(Update).order_by(desc(Update.lastUpdated)).first()
-        
-        if not latest_update:
-            raise HTTPException(status_code=404, detail="No data found")
-        
-        # Get all product statuses for this update
-        statuses = session.query(ProductStatus).options(joinedload(ProductStatus.product)).filter_by(update_id=latest_update.lastUpdated).all()
-        
-        products_dict = {}
-        for status in statuses:
-            products_dict[status.product_id] = {
-                "product_id": status.product_id,
-                "name": status.product.name if status.product else status.product_id,
-                "quick_status": {
-                    "sellPrice": status.sellPrice,
-                    "sellVolume": status.sellVolume,
-                    "sellMovingWeek": status.sellMovingWeek,
-                    "sellOrders": status.sellOrders,
-                    "buyPrice": status.buyPrice,
-                    "buyVolume": status.buyVolume,
-                    "buyMovingWeek": status.buyMovingWeek,
-                    "buyOrders": status.buyOrders
-                }
-            }
-            
-        return {
-            "lastUpdated": latest_update.lastUpdated,
-            "timestamp": latest_update.timestamp,
-            "product_count": len(products_dict),
-            "products": products_dict
-        }
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        yield session
     finally:
         session.close()
 
-@app.get("/products")
-def get_products():
-    session = get_db_session()
-    try:
-        products = session.query(Product).all()
-        return [{"id": p.id, "name": p.name} for p in products]
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        session.close()
 
-@app.get("/products/{product_id}/status")
-def get_product_status_history(
-    product_id: str,
-    start: Union[int, str, None] = Query(None, description="Start timestamp (ms) or ISO date string"),
-    end: Union[int, str, None] = Query(None, description="End timestamp (ms) or ISO date string"),
-    lookback: Optional[str] = Query(None, description="Lookback duration in MM:DD:HH:MM:SS format"),
-    limit: int = Query(100, le=1000, description="Max records to return")
-):
-    session = get_db_session()
-    try:
-        start_ts = parse_time_param(start)
-        end_ts = parse_time_param(end)
-        
-        if lookback:
-            lookback_ms = parse_lookback(lookback)
-            if end_ts:
-                start_ts = end_ts - lookback_ms
-            else:
-                # If end is not provided, default to now
-                now_ms = int(datetime.utcnow().timestamp() * 1000)
-                start_ts = now_ms - lookback_ms
-                # We don't necessarily set end_ts to now, as we want all data up to now (or whatever the latest is)
+def snapshot_meta(snapshot: RawSnapshot) -> dict:
+    return {
+        "id": snapshot.id,
+        "endpoint": snapshot.endpoint,
+        "fetched_at": snapshot.fetched_at.isoformat(),
+        "source_last_updated": snapshot.source_last_updated,
+        "response_hash": snapshot.response_hash,
+        "status_code": snapshot.status_code,
+        "payload_size_bytes": snapshot.payload_size_bytes,
+        "compressed_size_bytes": snapshot.compressed_size_bytes,
+    }
 
-        query = session.query(ProductStatus).join(Update).filter(ProductStatus.product_id == product_id)
-        
-        if start_ts:
-            query = query.filter(Update.timestamp >= start_ts)
-        if end_ts:
-            query = query.filter(Update.timestamp <= end_ts)
-            
-        # Order by timestamp desc
-        query = query.order_by(desc(Update.timestamp))
-        
-        statuses = query.limit(limit).all()
-        
-        result = []
-        for status in statuses:
-            result.append({
-                "timestamp": status.update.timestamp,
-                "lastUpdated": status.update.lastUpdated,
-                "sellPrice": status.sellPrice,
-                "sellVolume": status.sellVolume,
-                "sellOrders": status.sellOrders,
-                "buyPrice": status.buyPrice,
-                "buyVolume": status.buyVolume,
-                "buyOrders": status.buyOrders
-            })
-            
-        return result
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        session.close()
 
-@app.get("/products/{product_id}/buy-offers")
-def get_product_buy_offers(
-    product_id: str,
-    start: Union[int, str, None] = Query(None, description="Start timestamp (ms) or ISO date string"),
-    end: Union[int, str, None] = Query(None, description="End timestamp (ms) or ISO date string"),
-    lookback: Optional[str] = Query(None, description="Lookback duration in MM:DD:HH:MM:SS format"),
-    limit: int = Query(100, le=1000, description="Max records to return")
-):
-    session = get_db_session()
-    try:
-        start_ts = parse_time_param(start)
-        end_ts = parse_time_param(end)
+def export_meta(bundle: ExportBundle, request: Optional[Request] = None) -> dict:
+    base = PUBLIC_BASE_URL
+    if not base and request is not None:
+        base = str(request.base_url).rstrip("/")
+    download_url = f"{base}/exports/{bundle.id}?token={bundle.download_token}" if base else None
+    return {
+        "id": bundle.id,
+        "created_at": bundle.created_at.isoformat(),
+        "snapshot_count": bundle.snapshot_count,
+        "start_snapshot_id": bundle.start_snapshot_id,
+        "end_snapshot_id": bundle.end_snapshot_id,
+        "start_source_last_updated": bundle.start_source_last_updated,
+        "end_source_last_updated": bundle.end_source_last_updated,
+        "file_name": bundle.file_name,
+        "file_size_bytes": bundle.file_size_bytes,
+        "sha256": bundle.sha256,
+        "expires_at": bundle.expires_at.isoformat(),
+        "download_url": download_url,
+    }
 
-        if lookback:
-            lookback_ms = parse_lookback(lookback)
-            if end_ts:
-                start_ts = end_ts - lookback_ms
-            else:
-                now_ms = int(datetime.utcnow().timestamp() * 1000)
-                start_ts = now_ms - lookback_ms
 
-        # Join ProductStatus and Update to filter by time and product
-        query = session.query(BuyOffer).join(ProductStatus).join(Update).filter(ProductStatus.product_id == product_id)
-        
-        if start_ts:
-            query = query.filter(Update.timestamp >= start_ts)
-        if end_ts:
-            query = query.filter(Update.timestamp <= end_ts)
-            
-        query = query.order_by(desc(Update.timestamp))
-        
-        offers = query.limit(limit).all()
-        
-        result = []
-        for offer in offers:
-            result.append({
-                "timestamp": offer.product_status.update.timestamp,
-                "amount": offer.amount,
-                "pricePerUnit": offer.pricePerUnit,
-                "orders": offer.orders
-            })
-            
-        return result
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        session.close()
+def delete_expired_and_pressure_exports(session) -> None:
+    now = datetime.now(timezone.utc)
+    expired = session.query(ExportBundle).filter(ExportBundle.expires_at <= now).all()
+    for bundle in expired:
+        Path(bundle.file_path).unlink(missing_ok=True)
+        session.delete(bundle)
+    session.commit()
 
-@app.get("/products/{product_id}/sell-offers")
-def get_product_sell_offers(
-    product_id: str,
-    start: Union[int, str, None] = Query(None, description="Start timestamp (ms) or ISO date string"),
-    end: Union[int, str, None] = Query(None, description="End timestamp (ms) or ISO date string"),
-    lookback: Optional[str] = Query(None, description="Lookback duration in MM:DD:HH:MM:SS format"),
-    limit: int = Query(100, le=1000, description="Max records to return")
-):
-    session = get_db_session()
-    try:
-        start_ts = parse_time_param(start)
-        end_ts = parse_time_param(end)
+    bundles = session.query(ExportBundle).order_by(ExportBundle.created_at.asc()).all()
+    total = sum(Path(bundle.file_path).stat().st_size for bundle in bundles if Path(bundle.file_path).exists())
+    for bundle in bundles:
+        if total <= BACKUP_CACHE_BYTES:
+            break
+        path = Path(bundle.file_path)
+        size = path.stat().st_size if path.exists() else 0
+        path.unlink(missing_ok=True)
+        total -= size
+        session.delete(bundle)
+    session.commit()
 
-        if lookback:
-            lookback_ms = parse_lookback(lookback)
-            if end_ts:
-                start_ts = end_ts - lookback_ms
-            else:
-                now_ms = int(datetime.utcnow().timestamp() * 1000)
-                start_ts = now_ms - lookback_ms
-
-        query = session.query(SellOffer).join(ProductStatus).join(Update).filter(ProductStatus.product_id == product_id)
-        
-        if start_ts:
-            query = query.filter(Update.timestamp >= start_ts)
-        if end_ts:
-            query = query.filter(Update.timestamp <= end_ts)
-            
-        query = query.order_by(desc(Update.timestamp))
-        
-        offers = query.limit(limit).all()
-        
-        result = []
-        for offer in offers:
-            result.append({
-                "timestamp": offer.product_status.update.timestamp,
-                "amount": offer.amount,
-                "pricePerUnit": offer.pricePerUnit,
-                "orders": offer.orders
-            })
-            
-        return result
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        session.close()
 
 @app.get("/health")
-def health_check():
+def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/snapshots", dependencies=[Depends(require_api_key)])
+def list_snapshots(
+    limit: int = Query(100, ge=1, le=1000),
+    before_id: Optional[int] = None,
+    session=Depends(session_scope),
+) -> dict:
+    query = session.query(RawSnapshot).order_by(desc(RawSnapshot.id))
+    if before_id is not None:
+        query = query.filter(RawSnapshot.id < before_id)
+    snapshots = query.limit(limit).all()
+    return {"snapshots": [snapshot_meta(snapshot) for snapshot in snapshots]}
+
+
+@app.get("/snapshots/latest", dependencies=[Depends(require_api_key)])
+def latest_snapshot(session=Depends(session_scope)) -> dict:
+    snapshot = session.query(RawSnapshot).order_by(desc(RawSnapshot.id)).first()
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="No snapshots found")
+    payload = json.loads(gzip.decompress(snapshot.payload_gzip).decode("utf-8"))
+    return {"metadata": snapshot_meta(snapshot), "payload": payload}
+
+
+@app.get("/snapshots/{snapshot_id}", dependencies=[Depends(require_api_key)])
+def get_snapshot(snapshot_id: int, session=Depends(session_scope)) -> dict:
+    snapshot = session.get(RawSnapshot, snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    payload = json.loads(gzip.decompress(snapshot.payload_gzip).decode("utf-8"))
+    return {"metadata": snapshot_meta(snapshot), "payload": payload}
+
+
+@app.get("/storage/status", dependencies=[Depends(require_api_key)])
+def storage_status(session=Depends(session_scope)) -> dict:
+    count = session.query(func.count(RawSnapshot.id)).scalar() or 0
+    avg_compressed = session.query(func.avg(RawSnapshot.compressed_size_bytes)).scalar() or 442048
+    oldest = session.query(RawSnapshot).order_by(RawSnapshot.id.asc()).first()
+    newest = session.query(RawSnapshot).order_by(desc(RawSnapshot.id)).first()
+
+    db_size = session.execute(text("SELECT pg_database_size(current_database())")).scalar()
+    disk = shutil.disk_usage(EXPORT_DIR)
+    used_percent = round((disk.used / disk.total) * 100, 2)
+    snapshots_per_day = max(1, int(86400 / SNAPSHOT_INTERVAL_SECONDS))
+    estimated_daily_bytes = int(avg_compressed * snapshots_per_day)
+    estimated_days_remaining = int(disk.free / estimated_daily_bytes) if estimated_daily_bytes else None
+
+    return {
+        "snapshot_count": count,
+        "oldest_snapshot": snapshot_meta(oldest) if oldest else None,
+        "newest_snapshot": snapshot_meta(newest) if newest else None,
+        "database_size_bytes": db_size,
+        "avg_compressed_snapshot_bytes": int(avg_compressed),
+        "estimated_daily_archive_bytes": estimated_daily_bytes,
+        "disk": {
+            "total_bytes": disk.total,
+            "used_bytes": disk.used,
+            "free_bytes": disk.free,
+            "used_percent": used_percent,
+            "warning": used_percent >= DISK_WARN_PERCENT,
+        },
+        "estimated_days_remaining_at_current_average": estimated_days_remaining,
+    }
+
+
+@app.get("/exports", dependencies=[Depends(require_api_key)])
+def list_exports(request: Request, session=Depends(session_scope)) -> dict:
+    delete_expired_and_pressure_exports(session)
+    bundles = session.query(ExportBundle).order_by(desc(ExportBundle.created_at)).all()
+    return {"exports": [export_meta(bundle, request) for bundle in bundles]}
+
+
+@app.post("/exports", dependencies=[Depends(require_api_key)])
+def create_export(
+    request: Request,
+    start_id: Optional[int] = Query(default=None, ge=1),
+    end_id: Optional[int] = Query(default=None, ge=1),
+    days: Optional[int] = Query(default=7, ge=1, le=90),
+    expires_in_days: int = Query(default=7, ge=1, le=30),
+    session=Depends(session_scope),
+) -> dict:
+    delete_expired_and_pressure_exports(session)
+
+    query = session.query(RawSnapshot)
+    if start_id is not None:
+        query = query.filter(RawSnapshot.id >= start_id)
+    if end_id is not None:
+        query = query.filter(RawSnapshot.id <= end_id)
+    if start_id is None and end_id is None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days or 7)
+        query = query.filter(RawSnapshot.fetched_at >= cutoff)
+    ordered = query.order_by(RawSnapshot.id.asc())
+    first = ordered.first()
+    if not first:
+        raise HTTPException(status_code=404, detail="No snapshots found for export range")
+    last = query.order_by(desc(RawSnapshot.id)).first()
+    snapshot_count = query.count()
+    created_at = datetime.now(timezone.utc)
+    file_name = (
+        f"bazaar_{first.source_last_updated}_{last.source_last_updated}_"
+        f"{created_at.strftime('%Y%m%d%H%M%S')}.jsonl.gz"
+    )
+    file_path = EXPORT_DIR / file_name
+
+    sha = hashlib.sha256()
+    with gzip.open(file_path, "wt", encoding="utf-8") as fh:
+        for snapshot in ordered.yield_per(100):
+            payload_text = gzip.decompress(snapshot.payload_gzip).decode("utf-8")
+            record = {"metadata": snapshot_meta(snapshot), "payload": json.loads(payload_text)}
+            line = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+            fh.write(line + "\n")
+
+    with file_path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            sha.update(chunk)
+
+    bundle = ExportBundle(
+        created_at=created_at,
+        start_snapshot_id=first.id,
+        end_snapshot_id=last.id,
+        start_source_last_updated=first.source_last_updated,
+        end_source_last_updated=last.source_last_updated,
+        snapshot_count=snapshot_count,
+        file_name=file_name,
+        file_path=str(file_path),
+        file_size_bytes=file_path.stat().st_size,
+        sha256=sha.hexdigest(),
+        download_token=secrets.token_urlsafe(48),
+        expires_at=created_at + timedelta(days=expires_in_days),
+    )
+    session.add(bundle)
+    session.commit()
+    session.refresh(bundle)
+    return {"export": export_meta(bundle, request)}
+
+
+@app.get("/exports/{export_id}")
+def download_export(export_id: int, token: str, session=Depends(session_scope)):
+    bundle = session.get(ExportBundle, export_id)
+    if not bundle:
+        raise HTTPException(status_code=404, detail="Export not found")
+    if bundle.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=410, detail="Export expired")
+    if not secrets.compare_digest(token, bundle.download_token):
+        raise HTTPException(status_code=401, detail="Invalid download token")
+    path = Path(bundle.file_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Export file missing")
+    return FileResponse(path, media_type="application/gzip", filename=bundle.file_name)

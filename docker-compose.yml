@@ -1,66 +1,80 @@
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: bazaar_postgres
-    restart: always
+    restart: unless-stopped
     environment:
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=bazaar_data
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-bazaar_data}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-bazaar_data}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - bazaar-network
 
-  fetcher:
+  collector:
     build: ./scraper
-    container_name: bazaar_fetcher
-    restart: always
+    container_name: bazaar_collector
+    restart: unless-stopped
     command: ["python", "fetcher.py"]
     environment:
-      - POSTGRES_URI=postgresql://user:password@postgres:5432/bazaar_data
+      POSTGRES_URI: postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-bazaar_data}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-15}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-10}
     depends_on:
-      - postgres
-    networks:
-      - bazaar-network
-
-  sql_processor:
-    build: ./scraper
-    container_name: bazaar_sql_processor
-    restart: always
-    command: ["python", "sql_processor.py"]
-    environment:
-      - POSTGRES_URI=postgresql://user:password@postgres:5432/bazaar_data
-    depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     networks:
       - bazaar-network
 
   api:
     build: ./api
     container_name: bazaar_api
-    restart: always
+    restart: unless-stopped
     ports:
-      - "8001:8000"
+      - "${API_PORT:-8001}:8000"
     environment:
-      - POSTGRES_URI=postgresql://user:password@postgres:5432/bazaar_data
+      POSTGRES_URI: postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-bazaar_data}
+      API_KEY: ${API_KEY:-dev-api-key}
+      EXPORT_DIR: /exports
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      BACKUP_CACHE_BYTES: ${BACKUP_CACHE_BYTES:-26843545600}
+      DISK_WARN_PERCENT: ${DISK_WARN_PERCENT:-80}
+      SNAPSHOT_INTERVAL_SECONDS: ${SNAPSHOT_INTERVAL_SECONDS:-20}
+    volumes:
+      - ${DATA_DIR:-./data}/exports:/exports
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     networks:
       - bazaar-network
 
-  adminer:
-    image: adminer
-    container_name: bazaar_adminer
-    restart: always
-    ports:
-      - "8080:8080"
+  discord_bot:
+    build: ./bot
+    container_name: bazaar_discord_bot
+    restart: unless-stopped
+    environment:
+      POSTGRES_URI: postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-bazaar_data}
+      API_BASE_URL: http://api:8000
+      API_KEY: ${API_KEY:-dev-api-key}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_ALLOWED_USER_IDS: ${DISCORD_ALLOWED_USER_IDS:-}
+      DISCORD_ALLOWED_GUILD_IDS: ${DISCORD_ALLOWED_GUILD_IDS:-}
+      DISCORD_ALERT_CHANNEL_ID: ${DISCORD_ALERT_CHANNEL_ID:-}
+      DISK_ALERT_PERCENT: ${DISK_ALERT_PERCENT:-80}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-3-5-haiku-latest}
+    depends_on:
+      api:
+        condition: service_started
     networks:
       - bazaar-network
 
 networks:
   bazaar-network:
     driver: bridge
-
-volumes:
-  postgres-data:
