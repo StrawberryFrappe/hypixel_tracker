@@ -1,9 +1,39 @@
+# Secrets and local overrides
+.env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-venv/
-.env
+*.egg-info/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+coverage.xml
+htmlcov/
+
+# Frontend
+frontend/coverage/
+frontend/dist/
+frontend/node_modules/
+
+# Documentation and tooling
+site/
+.cache/
+
+# Runtime data and artifacts
+data/
+parquet/
+recovery/
+staging/
+*.log
+
+# Editors and operating systems
 .DS_Store
 .idea/
 .vscode/
-*.log
+
+# Project-local agent memory remains ignored by agents/.gitignore.
+agents/local/

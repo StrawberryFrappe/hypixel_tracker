@@ -5,7 +5,7 @@
 | Kernel acceptance rule | Harness governance | 0001 | HM-WI-001 | GATE-HM, GATE-DR, mount review |
 | Hybrid rescue decision | Release boundaries | 0002 | R1-WI-002, R1-WI-011 | GATE-RESCUE, architecture review |
 | Official Bazaar schema and live payload | R1-FR-001, R1-FR-002, R1-FR-003, R1-FR-003A, R1-FR-004 through R1-FR-006, NFR-DATA-001/002 | 0003 | R1-WI-001, R1-WI-003 through R1-WI-005 | GATE-POLICY, GATE-BENCH, GATE-DATA, GATE-TEST |
-| User-selected two-database topology | R1-FR-003A/003B/004/005A, NFR-DATA-003/004, NFR-QUAL-002 | 0003, 0007 | R1-WI-002, R1-WI-005 | GATE-ARCH, GATE-DATA, GATE-TEST |
+| User-selected two-database topology | R1-FR-003A/003B/004/005A, NFR-DATA-003/004, NFR-QUAL-002 | 0003, 0007 | R1-WI-002, R1-WI-005 | GATE-ARCH, GATE-DATA, GATE-TEST, EV-006 scaffold evidence |
 | Official Hypixel policy | NFR-COMP-001 | 0006 | R1-WI-001 | GATE-POLICY and dated policy evidence |
 | LAN deployment and one-admin decision | R1-FR-007, R1-FR-016, NFR-SEC-001/002 | 0004 | R1-WI-006, R1-WI-010 | GATE-API-SEC, GATE-DEPLOY |
 | Dashboard and trade ranking | R1-FR-008 through R1-FR-011, NFR-UX-001 | 0004, 0006 | R1-WI-006, R1-WI-007 | GATE-API-SEC, GATE-PQ, browser evidence |

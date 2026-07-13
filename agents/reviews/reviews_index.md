@@ -8,3 +8,4 @@
 | 2026-07-13 | [Harness mount review](20260713/harness_mount_review.md) | Accepted with recorded ASM-007/008 corrections |
 | 2026-07-13 | [Architecture and release plan review](20260713/architecture_plan_review.md) | Clean for implementation |
 | 2026-07-13 | [Deployment laptop agent tooling review](20260713/tooling_review.md) | Clean; authentication deferred |
+| 2026-07-13 | [Release 1 scaffold review](20260713/scaffold_review.md) | Clean P0/P1; integration evidence deferred |

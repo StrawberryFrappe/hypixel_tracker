@@ -1,0 +1,272 @@
+name: bazaar-guru
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-python-service: &python-service
+  <<: *service-defaults
+  build:
+    context: .
+    dockerfile: infra/python/Dockerfile
+  image: bazaar-guru-python:scaffold
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=32m,mode=1777
+
+services:
+  raw-db:
+    <<: *service-defaults
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${RAW_DB_NAME:?Set RAW_DB_NAME}
+      POSTGRES_USER: ${RAW_BOOTSTRAP_USER:?Set RAW_BOOTSTRAP_USER}
+      POSTGRES_PASSWORD: ${RAW_BOOTSTRAP_PASSWORD:?Set RAW_BOOTSTRAP_PASSWORD}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      DB_MIGRATOR_USER: ${RAW_MIGRATOR_USER:?Set RAW_MIGRATOR_USER}
+      DB_MIGRATOR_PASSWORD: ${RAW_MIGRATOR_PASSWORD:?Set RAW_MIGRATOR_PASSWORD}
+      DB_RUNTIME_USER: ${RAW_RUNTIME_USER:?Set RAW_RUNTIME_USER}
+      DB_RUNTIME_PASSWORD: ${RAW_RUNTIME_PASSWORD:?Set RAW_RUNTIME_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - max_connections=40
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=48MB
+    entrypoint: ["/usr/local/bin/validate-postgres-env"]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -f "$${PGDATA}/.bazaar-guru-bootstrap-complete" &&
+          PGPASSWORD="$${DB_RUNTIME_PASSWORD}" psql --host=127.0.0.1
+          --username="$${DB_RUNTIME_USER}" --dbname="$${POSTGRES_DB}"
+          --set=ON_ERROR_STOP=1 --tuples-only --no-align --command='SELECT 1'
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    volumes:
+      - raw-db-data:/var/lib/postgresql/data
+      - ./infra/postgres/005-validate-env.sh:/usr/local/bin/validate-postgres-env:ro
+      - ./infra/postgres/010-create-roles.sh:/docker-entrypoint-initdb.d/010-create-roles.sh:ro
+    networks:
+      - raw-db-net
+    shm_size: 64m
+    mem_limit: 768m
+    cpus: 0.55
+    pids_limit: 160
+
+  app-db:
+    <<: *service-defaults
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${APP_DB_NAME:?Set APP_DB_NAME}
+      POSTGRES_USER: ${APP_BOOTSTRAP_USER:?Set APP_BOOTSTRAP_USER}
+      POSTGRES_PASSWORD: ${APP_BOOTSTRAP_PASSWORD:?Set APP_BOOTSTRAP_PASSWORD}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      DB_MIGRATOR_USER: ${APP_MIGRATOR_USER:?Set APP_MIGRATOR_USER}
+      DB_MIGRATOR_PASSWORD: ${APP_MIGRATOR_PASSWORD:?Set APP_MIGRATOR_PASSWORD}
+      DB_RUNTIME_USER: ${APP_RUNTIME_USER:?Set APP_RUNTIME_USER}
+      DB_RUNTIME_PASSWORD: ${APP_RUNTIME_PASSWORD:?Set APP_RUNTIME_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - max_connections=40
+      - -c
+      - shared_buffers=192MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+    entrypoint: ["/usr/local/bin/validate-postgres-env"]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -f "$${PGDATA}/.bazaar-guru-bootstrap-complete" &&
+          PGPASSWORD="$${DB_RUNTIME_PASSWORD}" psql --host=127.0.0.1
+          --username="$${DB_RUNTIME_USER}" --dbname="$${POSTGRES_DB}"
+          --set=ON_ERROR_STOP=1 --tuples-only --no-align --command='SELECT 1'
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    volumes:
+      - app-db-data:/var/lib/postgresql/data
+      - ./infra/postgres/005-validate-env.sh:/usr/local/bin/validate-postgres-env:ro
+      - ./infra/postgres/010-create-roles.sh:/docker-entrypoint-initdb.d/010-create-roles.sh:ro
+    networks:
+      - app-db-net
+    shm_size: 64m
+    mem_limit: 1024m
+    cpus: 0.65
+    pids_limit: 160
+
+  raw-migrate:
+    <<: *python-service
+    restart: "no"
+    command: ["alembic", "-c", "alembic_raw.ini", "upgrade", "head"]
+    environment:
+      BAZAAR_GURU_RAW_MIGRATION_DATABASE_URL: ${BAZAAR_GURU_RAW_MIGRATION_DATABASE_URL:?Set BAZAAR_GURU_RAW_MIGRATION_DATABASE_URL}
+      BAZAAR_GURU_RAW_RUNTIME_ROLE: ${RAW_RUNTIME_USER:?Set RAW_RUNTIME_USER}
+    depends_on:
+      raw-db:
+        condition: service_healthy
+    networks:
+      - raw-db-net
+    mem_limit: 192m
+    cpus: 0.25
+    pids_limit: 80
+
+  app-migrate:
+    <<: *python-service
+    restart: "no"
+    command: ["alembic", "-c", "alembic_app.ini", "upgrade", "head"]
+    environment:
+      BAZAAR_GURU_APP_MIGRATION_DATABASE_URL: ${BAZAAR_GURU_APP_MIGRATION_DATABASE_URL:?Set BAZAAR_GURU_APP_MIGRATION_DATABASE_URL}
+      BAZAAR_GURU_APP_RUNTIME_ROLE: ${APP_RUNTIME_USER:?Set APP_RUNTIME_USER}
+    depends_on:
+      app-db:
+        condition: service_healthy
+    networks:
+      - app-db-net
+    mem_limit: 192m
+    cpus: 0.25
+    pids_limit: 80
+
+  api:
+    <<: *python-service
+    command:
+      - uvicorn
+      - bazaar_guru.api:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+      - --no-access-log
+    environment:
+      BAZAAR_GURU_APP_DATABASE_URL: ${BAZAAR_GURU_APP_DATABASE_URL:?Set BAZAAR_GURU_APP_DATABASE_URL}
+      BAZAAR_GURU_RAW_READINESS_URL: http://collector:8001
+      BAZAAR_GURU_DATABASE_POOL_SIZE: "3"
+      BAZAAR_GURU_DATABASE_MAX_OVERFLOW: "1"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      - edge-net
+      - app-db-net
+      - health-net
+    mem_limit: 384m
+    cpus: 0.50
+    pids_limit: 120
+
+  collector:
+    <<: *python-service
+    command:
+      - uvicorn
+      - bazaar_guru.collector:create_collector_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+      - --workers
+      - "1"
+      - --no-access-log
+    environment:
+      BAZAAR_GURU_RAW_DATABASE_URL: ${BAZAAR_GURU_RAW_DATABASE_URL:?Set BAZAAR_GURU_RAW_DATABASE_URL}
+      BAZAAR_GURU_DATABASE_POOL_SIZE: "2"
+      BAZAAR_GURU_DATABASE_MAX_OVERFLOW: "0"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/internal/health/live', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      - raw-db-net
+      - health-net
+    mem_limit: 192m
+    cpus: 0.25
+    pids_limit: 80
+
+  worker-scaffold:
+    <<: *python-service
+    profiles: ["pipeline-scaffold"]
+    restart: "no"
+    command: ["python", "-m", "bazaar_guru.cli", "worker"]
+    depends_on:
+      raw-migrate:
+        condition: service_completed_successfully
+      app-migrate:
+        condition: service_completed_successfully
+    networks:
+      - raw-db-net
+      - app-db-net
+    mem_limit: 512m
+    cpus: 0.75
+    pids_limit: 120
+
+  edge:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: infra/edge/Dockerfile
+    image: bazaar-guru-edge:scaffold
+    environment:
+      BAZAAR_GURU_HOSTNAME: ${BAZAAR_GURU_HOSTNAME:-localhost}
+    ports:
+      - "${BAZAAR_GURU_BIND_ADDRESS:-127.0.0.1}:443:8443"
+    networks:
+      - edge-net
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 80
+
+networks:
+  edge-net:
+    internal: true
+  raw-db-net:
+    internal: true
+  app-db-net:
+    internal: true
+  health-net:
+    internal: true
+
+volumes:
+  raw-db-data:
+  app-db-data:
+  caddy-data:
+  caddy-config:

@@ -2,8 +2,9 @@
 
 ## Current Phase
 
-Harness and staged Release 1-3 plan accepted on 2026-07-13. Corrected architecture
-and deployment-laptop tooling reviews are clean. Release 1 scaffold is next.
+Harness and staged Release 1-3 plan accepted on 2026-07-13. Release 1 scaffold,
+offline migrations, CI, Vue shell, and public-doc foundation are implemented.
+Independent backend and frontend reviews converged to clean P0/P1.
 
 ## Verified State
 
@@ -17,6 +18,13 @@ and deployment-laptop tooling reviews are clean. Release 1 scaffold is next.
   ignored local records.
 - No application code, database, container, build, or deployment was changed
   during mounting.
+- Release 1 scaffold tests pass: 20 Python tests, one Vue test, lint, format,
+  typecheck, frontend build, strict MkDocs build, npm audit, dependency locks,
+  Compose rendering, and offline Raw/Application upgrade/downgrade SQL.
+- Database startup rejects placeholders and unsafe partial initialization;
+  runtime readiness checks expected revisions and required tables.
+- GitHub Actions use commit SHAs and Pages deployment authority is isolated to
+  the main-branch deploy job.
 
 ## Product Direction
 
@@ -30,10 +38,13 @@ tested backup/restore. Forecasting is staged behind the data foundation.
 - Local certificate distribution, API-key scopes, and backup encryption/scope
   require implementation-plan decisions.
 - Forecast model metrics and acceptance thresholds remain Release 2 decisions.
-- Two-database migrations, role boundaries, and memory caps require implementation
-  evidence before release.
+- Online PostgreSQL role/migration, Compose restart/outage, image build, Caddy,
+  browser, `/srv`, and resource-cap evidence remain before release. Local Docker
+  daemon socket is unavailable for scaffold integration smoke.
+- Cavecrew config now targets `openai/gpt-5.6-sol`; current OpenCode session must
+  restart before dispatch verification.
 
 ## Next Action
 
-Build locked Release 1 scaffold, two-database migrations, CI, Compose, Vue shell,
-and MkDocs foundation; then run scaffold review.
+Refresh collector policy/fixture evidence, then implement bounded adaptive
+collector and exact Raw PostgreSQL ledger/body capture under R1-WI-004.

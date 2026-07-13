@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bazaar-guru"
+version = "0.1.0"
+description = "LAN-only, unofficial Hypixel Bazaar advisory assistant"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "alembic>=1.16.4,<1.17",
+  "fastapi>=0.116.1,<0.117",
+  "httpx>=0.28.1,<0.29",
+  "psycopg[binary]>=3.2.9,<3.3",
+  "pydantic-settings>=2.10.1,<2.11",
+  "sqlalchemy>=2.0.41,<2.1",
+  "uvicorn[standard]>=0.35.0,<0.36",
+]
+
+[project.scripts]
+bazaar-guru = "bazaar_guru.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.1,<8.5",
+  "ruff>=0.12.4,<0.13",
+]
+docs = [
+  "mkdocs-material>=9.6.15,<9.7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bazaar_guru"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
