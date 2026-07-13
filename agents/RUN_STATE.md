@@ -3,7 +3,7 @@
 ## Current Phase
 
 Harness and staged Release 1-3 plan accepted on 2026-07-13. Corrected architecture
-review is clean; Git safety baseline is next.
+and deployment-laptop tooling reviews are clean. Release 1 scaffold is next.
 
 ## Verified State
 
@@ -35,5 +35,5 @@ tested backup/restore. Forecasting is staged behind the data foundation.
 
 ## Next Action
 
-Create backup branch/tag and stacked Release 1 branch exactly as
-`planning/RELEASE_PLAN.md` specifies.
+Build locked Release 1 scaffold, two-database migrations, CI, Compose, Vue shell,
+and MkDocs foundation; then run scaffold review.
