@@ -47,6 +47,8 @@ Final backend and frontend review results: `CLEAN P0/P1`.
 - Raw and Application offline upgrade/downgrade SQL generation: passed.
 - PostgreSQL bootstrap scripts: shell syntax and environment-guard tests passed.
 - `git diff --check`: passed.
+- GitHub CI run `29273575490`: Python, frontend, Compose, and gitleaks jobs passed
+  with SHA-pinned current-major actions and no annotations.
 
 ## Residual Evidence Gaps
 
@@ -55,8 +57,7 @@ Final backend and frontend review results: `CLEAN P0/P1`.
   persistence, authenticated health, or online upgrade/downgrade.
 - No Compose outage/restart test, Caddy HTTPS smoke, browser viewport/accessibility
   evidence, target `/srv` bind-mount override, or resource benchmark exists yet.
-- Local `gitleaks` is unavailable; SHA-pinned CI secret scanning is configured but
-  has not run on GitHub.
+- Local `gitleaks` is unavailable; the SHA-pinned GitHub secret scan passed.
 - Container base tags and GitHub-hosted runner labels remain mutable; deployment
   image digests require a later release manifest.
 

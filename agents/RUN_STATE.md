@@ -25,6 +25,8 @@ Independent backend and frontend reviews converged to clean P0/P1.
   runtime readiness checks expected revisions and required tables.
 - GitHub Actions use commit SHAs and Pages deployment authority is isolated to
   the main-branch deploy job.
+- GitHub CI run `29273575490` passed Python, frontend, Compose, and secret-scan
+  jobs without annotations.
 
 ## Product Direction
 
